@@ -29,6 +29,7 @@ client = httpx.AsyncClient(
 # ------------ Schemas ------------
 class ChatIn(BaseModel):
     message_tat: str
+    scenario: Optional[Literal["studying", "dialog"]] = "dialog"
     # опционально — прокинуть системные инструкции модели
     system_prompt_ru: Optional[str] = None
 
@@ -117,15 +118,36 @@ app = FastAPI(title="Tat↔Ru dialog proxy", version="1.0.0")
 
 @app.post("/chat", response_model=ChatOut)
 async def chat(incoming: ChatIn):
-    # Skip TatSoft translation and send Tatar text directly to GigaChat
-    # 1) GigaChat (using original Tatar text)
-    tat_answer = await gigachat_complete(incoming.message_tat, incoming.system_prompt_ru)
+    # Определяем базовый системный промпт в зависимости от сценария
+    base_system_prompt = ""
+    if incoming.scenario == "dialog":
+        base_system_prompt = """
+Ты - помощник, свободно владеющий татарским языком. 
+Твоя задача - вести диалог на татарском языке, отвечая на вопросы пользователя.
+Отвечай ТОЛЬКО на татарском языке, используя современную орфографию.
+Будь дружелюбным и полезным собеседником.
+        """
+    else:  # studying
+        base_system_prompt = """
+Ты - преподаватель татарского языка.
+Твоя задача - помогать в изучении татарского языка.
+
+Отвечай на русском языке.
+        """
+    
+    # Объединяем базовый системный промпт с пользовательским, если он есть
+    system_prompt = base_system_prompt
+    if incoming.system_prompt_ru:
+        system_prompt = f"{base_system_prompt}\n\nДополнительные инструкции:\n{incoming.system_prompt_ru}"
+
+    # Получаем ответ от модели
+    response = await gigachat_complete(incoming.message_tat, system_prompt)
 
     return ChatOut(
         input_tat=incoming.message_tat,
-        translated_to_ru="Пропущено - отправлено напрямую в GigaChat",
-        model_answer_ru="Пропущено - ответ от GigaChat на татарском",
-        translated_back_to_tat=tat_answer,
+        translated_to_ru="Прямое общение с моделью",
+        model_answer_ru="Ответ модели в зависимости от сценария",
+        translated_back_to_tat=response,
     )
 
 @app.get("/health")
