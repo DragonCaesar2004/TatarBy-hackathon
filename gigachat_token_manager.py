@@ -35,7 +35,8 @@ class GigaChatTokenManager:
         """Фоновый поток для обновления токена"""
         while not self._stop_worker:
             try:
-                new_token = self._giga.get_token()
+                token_obj = self._giga.get_token()
+                new_token = f"Bearer {token_obj.access_token}"
                 with self._token_lock:
                     self._token = new_token
                 print("[GigaChat] Токен успешно обновлен")
@@ -49,7 +50,8 @@ class GigaChatTokenManager:
         """Получить текущий токен"""
         with self._token_lock:
             if self._token is None:
-                self._token = self._giga.get_token()
+                token_obj = self._giga.get_token()
+                self._token = f"Bearer {token_obj.access_token}"
             return self._token
     
     def stop(self):

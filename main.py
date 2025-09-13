@@ -57,7 +57,7 @@ async def gigachat_complete(prompt_ru: str, system_ru: Optional[str]) -> str:
         raise HTTPException(500, "Не удалось получить токен GigaChat")
 
     headers = {
-        "Authorization": f"Bearer {bearer}",
+        "Authorization": bearer,  # Токен уже содержит префикс Bearer
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
