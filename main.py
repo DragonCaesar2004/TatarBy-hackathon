@@ -5,12 +5,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 
+from gigachat_token_manager import get_token
+
 # ------------ Settings ------------
 class Settings(BaseSettings):
     TATSOFT_BASE_URL: str = "https://v2.api.translate.tatar"
-    GIGACHAT_BASE_URL: str
-    GIGACHAT_TOKEN: str
-    GIGACHAT_MODEL: str = "gigachat"
+    GIGACHAT_BASE_URL: str = "https://gigachat.devices.sberbank.ru/api/v1"
+    GIGACHAT_MODEL: str = "GigaChat"
     REQUEST_TIMEOUT_SECONDS: int = 15
 
     class Config:
@@ -42,34 +43,6 @@ class ChatOut(BaseModel):
 # ------------ Helpers ------------
 
 
-async def get_gigachat_access_token() -> str:
-    """
-    Получение access token через OAuth2 client credentials flow.
-    """
-    url = f"{settings.GIGACHAT_BASE_URL}/token"  # Стандартный endpoint для получения токенов
-    headers = {
-        "Authorization": f"Basic {settings.GIGACHAT_TOKEN}",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "RqUID": "unique-request-id",  # Некоторые API требуют уникальный ID запроса
-    }
-    data = {
-        "grant_type": "client_credentials",  # Стандартный тип для client credentials flow
-    }
-    
-    for attempt in range(3):
-        try:
-            r = await client.post(url, headers=headers, data=data)
-            if r.status_code == 200:
-                token_data = r.json()
-                return token_data["access_token"]
-            if 400 <= r.status_code < 500:
-                raise HTTPException(r.status_code, f"GigaChat Token: {r.text}")
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError):
-            pass
-        await asyncio.sleep(0.4 * (attempt + 1))
-    
-    raise HTTPException(502, "GigaChat Token service недоступен после повторных попыток")
-
 
 
 async def gigachat_complete(prompt_ru: str, system_ru: Optional[str]) -> str:
@@ -77,11 +50,11 @@ async def gigachat_complete(prompt_ru: str, system_ru: Optional[str]) -> str:
     Запрос в GigaChat API: chat/completions
     """
     url = f"{settings.GIGACHAT_BASE_URL}/chat/completions"
-
-    # токен в .env должен быть без кавычек и пробелов
-    bearer = (settings.GIGACHAT_TOKEN or "").strip(" '\"")
+    
+    # Получаем текущий действующий токен из менеджера
+    bearer = get_token()
     if not bearer:
-        raise HTTPException(500, "Нет GIGACHAT_TOKEN")
+        raise HTTPException(500, "Не удалось получить токен GigaChat")
 
     headers = {
         "Authorization": f"Bearer {bearer}",
