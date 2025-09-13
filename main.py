@@ -1,6 +1,6 @@
 from typing import Literal, Optional
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from gigachat_token_manager import get_token
@@ -35,7 +35,7 @@ class ChatOut(BaseModel):
     input_tat: str
     translated_to_ru: str
     model_answer_ru: str
-    translated_back_to_tat: str
+    audio_base64: str  # аудио в формате base64
 
 # ------------ Helpers ------------
 async def gigachat_complete(prompt_ru: str, system_ru: Optional[str]) -> str:
@@ -126,12 +126,29 @@ async def chat(incoming: ChatIn):
     # Сохраняем ответ ассистента в историю
     chat_history.add_message("assistant", response)
 
+    # Получаем аудио от TatSoft API
+    tts_url = "https://tat-tts.api.translate.tatar/listening/"
+    params = {
+        "speaker": "alsu",  # можно сделать параметром если нужно
+        "text": response
+    }
+    
+    async with httpx.AsyncClient(verify=False) as client:
+        audio_response = await client.get(tts_url, params=params)
+        if audio_response.status_code != 200:
+            raise HTTPException(502, f"TTS API error: {audio_response.text}")
+        
+        # Получаем аудио в base64 напрямую из содержимого ответа
+        audio_base64 = audio_response.text  # API возвращает base64 строку напрямую
+
     return ChatOut(
         input_tat=incoming.message_tat,
         translated_to_ru="Прямое общение с моделью",
         model_answer_ru="Ответ модели в зависимости от сценария",
-        translated_back_to_tat=response
+        audio_base64=audio_base64  # base64 строка из ответа API
     )
+
+
 
 @app.get("/health")
 async def health():
