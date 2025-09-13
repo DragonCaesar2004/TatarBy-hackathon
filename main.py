@@ -1,11 +1,10 @@
 from typing import Literal, Optional
-import asyncio
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
-
 from gigachat_token_manager import get_token
+from chat_history import chat_history
 
 # ------------ Settings ------------
 class Settings(BaseSettings):
@@ -21,7 +20,6 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # Общий HTTP-клиент (асинхронный)
-# Отключаем проверку SSL для работы с GigaChat (может потребоваться в некоторых случаях)
 client = httpx.AsyncClient(
     timeout=httpx.Timeout(settings.REQUEST_TIMEOUT_SECONDS),
     verify=False  # Отключение проверки SSL сертификатов
@@ -31,7 +29,6 @@ client = httpx.AsyncClient(
 class ChatIn(BaseModel):
     message_tat: str
     scenario: Optional[Literal["studying", "dialog"]] = "dialog"
-    # опционально — прокинуть системные инструкции модели
     system_prompt_ru: Optional[str] = None
 
 class ChatOut(BaseModel):
@@ -41,10 +38,6 @@ class ChatOut(BaseModel):
     translated_back_to_tat: str
 
 # ------------ Helpers ------------
-
-
-
-
 async def gigachat_complete(prompt_ru: str, system_ru: Optional[str]) -> str:
     """
     Запрос в GigaChat API: chat/completions
@@ -66,10 +59,15 @@ async def gigachat_complete(prompt_ru: str, system_ru: Optional[str]) -> str:
     messages = []
     if system_ru:
         messages.append({"role": "system", "content": system_ru})
+    
+    # Добавляем историю диалога
+    messages.extend(chat_history.get_messages())
+    
+    # Добавляем текущее сообщение
     messages.append({"role": "user", "content": prompt_ru})
 
     payload = {
-        "model": settings.GIGACHAT_MODEL or "GigaChat",  # лучше с большой буквы
+        "model": settings.GIGACHAT_MODEL,
         "messages": messages,
         "temperature": 0.2,
     }
@@ -99,13 +97,19 @@ async def chat(incoming: ChatIn):
 Твоя задача - вести диалог на татарском языке, отвечая на вопросы пользователя.
 Отвечай ТОЛЬКО на татарском языке, используя современную орфографию.
 Будь дружелюбным и полезным собеседником.
+Продолжай диалог и не присылай спецсимволы в ответ, так как потом он будет озвучиваться.
         """
     else:  # studying
         base_system_prompt = """
 Ты - преподаватель татарского языка.
 Твоя задача - помогать в изучении татарского языка.
-
+Когда пользователь пишет на татарском:
+1. Дай перевод на русский
+2. Объясни грамматические конструкции
+3. Укажи на ошибки, если они есть
+4. Предложи, как можно улучшить фразу
 Отвечай на русском языке.
+Не используй спецсимволы в ответе, так как потом он будет озвучиваться.
         """
     
     # Объединяем базовый системный промпт с пользовательским, если он есть
@@ -113,18 +117,30 @@ async def chat(incoming: ChatIn):
     if incoming.system_prompt_ru:
         system_prompt = f"{base_system_prompt}\n\nДополнительные инструкции:\n{incoming.system_prompt_ru}"
 
-    # Получаем ответ от модели
+    # Сохраняем сообщение пользователя в историю
+    chat_history.add_message("user", incoming.message_tat)
+    
+    # Получаем ответ от модели с учетом истории диалога
     response = await gigachat_complete(incoming.message_tat, system_prompt)
+    
+    # Сохраняем ответ ассистента в историю
+    chat_history.add_message("assistant", response)
 
     return ChatOut(
         input_tat=incoming.message_tat,
         translated_to_ru="Прямое общение с моделью",
         model_answer_ru="Ответ модели в зависимости от сценария",
-        translated_back_to_tat=response,
+        translated_back_to_tat=response
     )
 
 @app.get("/health")
 async def health():
+    return {"status": "ok"}
+
+@app.post("/clear-history")
+async def clear_chat_history():
+    """Очистить историю диалога"""
+    chat_history.clear()
     return {"status": "ok"}
 
 # Корректно закрываем клиент при остановке

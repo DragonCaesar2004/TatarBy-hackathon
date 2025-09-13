@@ -7,7 +7,7 @@ from typing import Optional
 from gigachat import GigaChat
 
 class GigaChatTokenManager:
-    def __init__(self, client_id: str, client_secret: str, refresh_interval_minutes: int = 1):
+    def __init__(self, client_id: str, client_secret: str, refresh_interval_minutes: int = 25):
         self.client_id = client_id
         self.client_secret = client_secret
         self.refresh_interval = refresh_interval_minutes * 60  # конвертируем в секунды
