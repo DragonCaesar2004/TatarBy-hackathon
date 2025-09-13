@@ -1,20 +1,20 @@
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple, List, Dict, Any
 import httpx
-import json
-from fastapi import FastAPI, HTTPException, Response
-from fastapi import UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from gigachat_token_manager import get_token
 from chat_history import chat_history
 
-# ------------ Settings ------------
+# =========================
+# Settings
+# =========================
 class Settings(BaseSettings):
     TATSOFT_BASE_URL: str = "https://v2.api.translate.tatar"
     GIGACHAT_BASE_URL: str = "https://gigachat.devices.sberbank.ru/api/v1"
+    # Твоя желаемая модель (может не уметь аудио) — авто-фолбэк выбирает подходящую
     GIGACHAT_MODEL: str = "GigaChat"
-    GIGACHAT_AUDIO_URL: Optional[str] = "https://gigachat.devices.sberbank.ru/api/v1/files"
-    REQUEST_TIMEOUT_SECONDS: int = 15
+    REQUEST_TIMEOUT_SECONDS: int = 20
 
     class Config:
         env_file = ".env"
@@ -22,13 +22,12 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Общий HTTP-клиент (асинхронный)
-client = httpx.AsyncClient(
-    timeout=httpx.Timeout(settings.REQUEST_TIMEOUT_SECONDS),
-    verify=False  # Отключение проверки SSL сертификатов
-)
+# Внутренний кэш найденной аудио-модели
+_AUDIO_MODEL_ID: Optional[str] = None
 
-# ------------ Schemas ------------
+# =========================
+# Schemas
+# =========================
 class ChatIn(BaseModel):
     message_tat: str
     scenario: Optional[Literal["studying", "dialog"]] = "dialog"
@@ -38,236 +37,329 @@ class ChatOut(BaseModel):
     input_tat: Optional[str] = None
     translated_to_ru: str
     model_answer_ru: str
-    audio_base64: str  # аудио в формате base64
+    audio_base64: str
     recognized_tat: Optional[str] = None
 
-# ------------ Helpers ------------
-async def gigachat_complete(prompt_ru: str, system_ru: Optional[str]) -> str:
-    """
-    Запрос в GigaChat API: chat/completions
-    """
-    url = f"{settings.GIGACHAT_BASE_URL}/chat/completions"
-    
-    # Получаем текущий действующий токен из менеджера
+# =========================
+# GigaChat low-level
+# =========================
+def _bearer() -> str:
     bearer = get_token()
     if not bearer:
         raise HTTPException(500, "Не удалось получить токен GigaChat")
+    return bearer
 
-    headers = {
-        "Authorization": bearer,  # Токен уже содержит префикс Bearer
+async def _client_json_headers() -> Dict[str, str]:
+    return {
+        "Authorization": _bearer(),
+        "Accept": "application/json",
         "Content-Type": "application/json",
+    }
+
+async def _client_multipart_headers() -> Dict[str, str]:
+    # НЕ задаём Content-Type вручную — httpx сам проставит boundary
+    return {
+        "Authorization": _bearer(),
         "Accept": "application/json",
     }
 
-    # формируем список сообщений
-    messages = []
-    if system_ru:
-        messages.append({"role": "system", "content": system_ru})
-    
-    # Добавляем историю диалога
-    messages.extend(chat_history.get_messages())
-    
-    # Добавляем текущее сообщение
-    messages.append({"role": "user", "content": prompt_ru})
+async def _gc_list_models() -> List[str]:
+    """
+    Возвращает список ID моделей (или пустой список, если недоступно).
+    """
+    base = settings.GIGACHAT_BASE_URL.rstrip("/")
+    headers = await _client_json_headers()
+    try:
+        async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS, verify=False) as client:
+            r = await client.get(f"{base}/models", headers=headers)
+        if r.status_code != 200:
+            return []
+        j = r.json()
+        data = j.get("data") or j.get("models") or []
+        ids: List[str] = []
+        for m in data:
+            mid = m.get("id")
+            if isinstance(mid, str):
+                ids.append(mid)
+        return ids
+    except Exception:
+        return []
 
+def _rank_audio_candidates(all_models: List[str]) -> List[str]:
+    """
+    Составляем перечень кандидатов на аудио-модель.
+    Приоритет: явно аудио-совместимые названия (по практике), затем — твоя preferred.
+    """
+    preferred = settings.GIGACHAT_MODEL
+    # Часто аудио поддерживают «вторые/профи» модели; добавь сюда свои корпоративные ID при необходимости.
+    known = [
+        "GigaChat-2",
+        "GigaChat-Pro",
+        "GigaChat-Max",
+        "GigaChat:2",           # префикс — будем матчить startswith
+        "GigaChat-Pro-preview",
+        "GigaChat-2-preview",
+        "GigaChat",
+    ]
+
+    # 1) если список моделей известен — отсортируем по приоритетам / префиксам
+    ranked: List[str] = []
+    if all_models:
+        # точные хиты
+        for k in known:
+            if ":" in k or "-" in k:
+                for mid in all_models:
+                    if mid == k and mid not in ranked:
+                        ranked.append(mid)
+        # префиксные хиты (например, GigaChat:2.0.28.2)
+        for mid in all_models:
+            if mid.startswith("GigaChat:2") and mid not in ranked:
+                ranked.append(mid)
+        # подстрахуемся: добавим preferred, если есть в списке
+        if preferred in all_models and preferred not in ranked:
+            ranked.append(preferred)
+        # добьём остальными chat-моделями (если хочется широкого перебора)
+        for mid in all_models:
+            if mid not in ranked:
+                ranked.append(mid)
+        return ranked
+
+    # 2) если /models недоступен — просто возвращаем known + preferred в конце
+    base = [m for m in known if m != preferred]
+    base.append(preferred)
+    # уберём дубли и вернём
+    seen = set()
+    out = []
+    for m in base:
+        if m not in seen:
+            out.append(m)
+            seen.add(m)
+    return out
+
+async def _gc_upload_file(filename: str, content: bytes, mime: str) -> str:
+    """
+    POST /files — загрузка файла в хранилище (multipart).
+    В некоторых контурах требуется purpose=general — передаём как обычное поле data.
+    """
+    base = settings.GIGACHAT_BASE_URL.rstrip("/")
+    headers = await _client_multipart_headers()
+
+    files = {"file": (filename, content, mime)}
+    data = {"purpose": "general"}
+
+    async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS, verify=False) as client:
+        r = await client.post(f"{base}/files", headers=headers, files=files, data=data)
+
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"GigaChat /files error: {r.text}")
+
+    j = r.json()
+    fid = j.get("id")
+    if not isinstance(fid, str):
+        raise HTTPException(502, f"Неожиданный ответ /files: {j}")
+    return fid
+
+async def _gc_chat_with_model(messages: List[Dict[str, Any]], model: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Пытаемся вызвать /chat/completions на конкретной модели.
+    Возвращает: (ok, assistant_text, raw_error_text)
+    """
+    base = settings.GIGACHAT_BASE_URL.rstrip("/")
+    headers = await _client_json_headers()
+    payload = {"model": model, "messages": messages, "temperature": 0.2}
+
+    async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS, verify=False) as client:
+        r = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
+
+    if r.status_code == 200:
+        j = r.json()
+        try:
+            return True, j["choices"][0]["message"]["content"], None
+        except Exception:
+            return False, None, f"Unexpected JSON: {r.text}"
+
+    # 422 из-за аудио — ключевой кейс
+    if r.status_code == 422 and "Model does not support audio" in r.text:
+        return False, None, "NO_AUDIO"
+
+    return False, None, r.text
+
+async def _gc_chat_auto(messages: List[Dict[str, Any]]) -> str:
+    """
+    Вызывает чат: если текущая модель не умеет аудио — автопоиск и кэширование подходящей.
+    """
+    global _AUDIO_MODEL_ID
+
+    # Если уже нашли и закэшировали — пробуем сначала её
+    if _AUDIO_MODEL_ID:
+        ok, text, err = await _gc_chat_with_model(messages, _AUDIO_MODEL_ID)
+        if ok:
+            return text
+        # если вдруг перестала работать — сбросим кэш и продолжим автопоиск
+        _AUDIO_MODEL_ID = None
+
+    # Составим список кандидатов: из /models (если доступен) + эвристики
+    all_models = await _gc_list_models()
+    candidates = _rank_audio_candidates(all_models)
+
+    # Пробуем по порядку, пока не найдём модель, которая принимает аудио
+    last_err = None
+    for mid in candidates:
+        ok, text, err = await _gc_chat_with_model(messages, mid)
+        if ok:
+            _AUDIO_MODEL_ID = mid  # кэшируем успешную
+            return text
+        last_err = err
+        # Если модель явно не поддерживает аудио — просто идём дальше
+        if err == "NO_AUDIO":
+            continue
+        # Иначе это другое отклонение (401/404/429/500) — тоже попробуем следующий mid
+
+    # Если сюда дошли — ни одна из моделей не приняла аудио
+    if last_err == "NO_AUDIO":
+        raise HTTPException(422, "Ни одна из доступных моделей не поддерживает аудио-вложения для вашего токена.")
+    raise HTTPException(502, f"Не удалось получить ответ от моделей: {last_err or 'unknown error'}")
+
+# =========================
+# High-level
+# =========================
+async def gigachat_complete(prompt_ru: str, system_ru: Optional[str]) -> str:
+    msgs: List[Dict[str, Any]] = []
+    if system_ru:
+        msgs.append({"role": "system", "content": system_ru})
+    msgs.extend(chat_history.get_messages())
+    msgs.append({"role": "user", "content": prompt_ru})
+
+    # Для чисто текстового режима используем твою базовую модель напрямую
+    base = settings.GIGACHAT_BASE_URL.rstrip("/")
+    headers = await _client_json_headers()
     payload = {
         "model": settings.GIGACHAT_MODEL,
-        "messages": messages,
+        "messages": msgs,
         "temperature": 0.2,
     }
-
-    async with httpx.AsyncClient(http2=False, timeout=20.0, verify=False) as client:
-        r = await client.post(url, headers=headers, json=payload)
-
+    async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS, verify=False) as client:
+        r = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"GigaChat error: {r.text}")
-
-    data = r.json()
+    j = r.json()
     try:
-        return data["choices"][0]["message"]["content"]
+        return j["choices"][0]["message"]["content"]
     except Exception:
-        raise HTTPException(502, f"GigaChat: неожиданный ответ {data}")
+        raise HTTPException(502, f"GigaChat: неожиданный ответ {j}")
 
-
-async def gigachat_audio_complete(wav_bytes: bytes, system_ru: Optional[str] = None) -> tuple:
-    """Send WAV bytes to GigaChat audio endpoint and return (json_dict_or_None, assistant_or_None).
-
-    Returns:
-      (parsed_json, assistant_text) if Content-Type is JSON (parsed_json may be any JSON),
-      (None, assistant_text) if response is plain text.
+async def gigachat_audio_complete(wav_bytes: bytes, system_ru: Optional[str]) -> Tuple[None, str]:
     """
-    if not settings.GIGACHAT_AUDIO_URL:
-        raise HTTPException(500, "GigaChat audio URL is not configured (GIGACHAT_AUDIO_URL)")
+    Аудио → ответ: /files -> /chat/completions + attachments.
+    Если модель не поддерживает аудио — авто-подбор подходящей и кэширование.
+    """
+    file_id = await _gc_upload_file("audio.wav", wav_bytes, "audio/wav")
 
-    bearer = get_token()
-    headers = {"Authorization": bearer} if bearer else {}
-
-    files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
-    data = {}
+    msgs: List[Dict[str, Any]] = []
     if system_ru:
-        data["system_prompt"] = system_ru
+        msgs.append({"role": "system", "content": system_ru})
+    msgs.extend(chat_history.get_messages())
+    msgs.append({
+        "role": "user",
+        "content": "Транскрибируй это аудио и ответь по инструкции.",
+        "attachments": [file_id],
+    })
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(settings.REQUEST_TIMEOUT_SECONDS), verify=False) as client:
-        r = await client.post(settings.GIGACHAT_AUDIO_URL, headers=headers, data=data, files=files)
+    assistant_text = await _gc_chat_auto(msgs)
+    return None, assistant_text
 
-    if r.status_code != 200:
-        raise HTTPException(502, f"GigaChat audio error: {r.status_code} {r.text}")
-
-    ctype = r.headers.get("Content-Type", "")
-    if "json" in ctype:
-        try:
-            j = r.json()
-        except Exception:
-            raise HTTPException(502, f"GigaChat audio returned invalid JSON: {r.text}")
-
-        assistant = None
-        if isinstance(j, dict) and isinstance(j.get("assistant"), str):
-            assistant = j.get("assistant")
-        return j, assistant
-
-    assistant = r.text.strip()
-    return None, assistant
-
-# ------------ FastAPI ------------
+# =========================
+# FastAPI
+# =========================
 app = FastAPI(title="Tat↔Ru dialog proxy", version="1.0.0")
 
 @app.post("/chat", response_model=ChatOut)
 async def chat(incoming: ChatIn):
-    # Определяем базовый системный промпт в зависимости от сценария
-    base_system_prompt = ""
     if incoming.scenario == "dialog":
-        base_system_prompt = """
-Ты - помощник, свободно владеющий татарским языком. 
-Твоя задача - вести диалог на татарском языке, отвечая на вопросы пользователя.
-Отвечай ТОЛЬКО на татарском языке, используя современную орфографию.
-Будь дружелюбным и полезным собеседником.
-Продолжай диалог и не присылай спецсимволы в ответ, так как потом он будет озвучиваться.
-        """
-    else:  # studying
-        base_system_prompt = """
-Ты - преподаватель татарского языка.
-Твоя задача - помогать в изучении татарского языка.
-Когда пользователь пишет на татарском:
-1. Дай перевод на русский
-2. Объясни грамматические конструкции
-3. Укажи на ошибки, если они есть
-4. Предложи, как можно улучшить фразу
-Отвечай на русском языке.
-Не используй спецсимволы в ответе, так как потом он будет озвучиваться.
-        """
-    
-    # Объединяем базовый системный промпт с пользовательским, если он есть
-    system_prompt = base_system_prompt
-    if incoming.system_prompt_ru:
-        system_prompt = f"{base_system_prompt}\n\nДополнительные инструкции:\n{incoming.system_prompt_ru}"
+        base_system_prompt = (
+            "Ты - помощник, свободно владеющий татарским языком. "
+            "Веди диалог ТОЛЬКО на татарском, современная орфография. "
+            "Не используй спецсимволы в ответе."
+        )
+    else:
+        base_system_prompt = (
+            "Ты - преподаватель татарского языка. "
+            "1) Переведи на русский. 2) Объясни грамматику. 3) Исправь ошибки. "
+            "4) Предложи улучшение. Отвечай на русском. Без спецсимволов."
+        )
+    system_prompt = (
+        base_system_prompt if not incoming.system_prompt_ru
+        else base_system_prompt + "\n\nДополнительные инструкции:\n" + incoming.system_prompt_ru
+    )
 
-    # Сохраняем сообщение пользователя в историю
     chat_history.add_message("user", incoming.message_tat)
-    
-    # Получаем ответ от модели с учетом истории диалога
-    response = await gigachat_complete(incoming.message_tat, system_prompt)
-    
-    # Сохраняем ответ ассистента в историю
-    chat_history.add_message("assistant", response)
+    response_text = await gigachat_complete(incoming.message_tat, system_prompt)
+    chat_history.add_message("assistant", response_text)
 
-    # Получаем аудио от TatSoft API
+    # TTS
     tts_url = "https://tat-tts.api.translate.tatar/listening/"
-    params = {
-        "speaker": "alsu",  # можно сделать параметром если нужно
-        "text": response
-    }
-    
-    async with httpx.AsyncClient(verify=False) as client:
+    params = {"speaker": "alsu", "text": response_text}
+    async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS, verify=False) as client:
         audio_response = await client.get(tts_url, params=params)
-        if audio_response.status_code != 200:
-            raise HTTPException(502, f"TTS API error: {audio_response.text}")
-        
-        # Получаем аудио в base64 напрямую из содержимого ответа
-        audio_base64 = audio_response.text  # API возвращает base64 строку напрямую
+    if audio_response.status_code != 200:
+        raise HTTPException(502, f"TTS API error: {audio_response.text}")
+    audio_base64 = audio_response.text
 
     return ChatOut(
         input_tat=incoming.message_tat,
         translated_to_ru="Прямое общение с моделью",
-        model_answer_ru="Ответ модели в зависимости от сценария",
-        audio_base64=audio_base64  # base64 строка из ответа API
+        model_answer_ru=response_text,
+        audio_base64=audio_base64,
     )
-
 
 @app.post("/chat-audio", response_model=ChatOut)
-async def chat_audio(file: UploadFile = File(...), scenario: Optional[Literal["studying", "dialog"]] = "dialog", system_prompt_ru: Optional[str] = None):
-    """
-    Accept a multipart WAV file upload (raw wav) from frontend, send it to STT service,
-    then forward recognized text to GigaChat. For `dialog` scenario a constant system
-    prompt will be prepended so GigaChat answers in Tatar.
-    """
-    if file.content_type not in ("audio/wav", "audio/x-wav", "audio/wave"):
-        raise HTTPException(400, "Only WAV audio files are supported (Content-Type audio/wav)")
+async def chat_audio(
+    file: UploadFile = File(...),
+    scenario: Optional[Literal["studying", "dialog"]] = "dialog",
+    system_prompt_ru: Optional[str] = None,
+):
+    if file.content_type not in ("audio/wav", "audio/x-wav", "audio/wave", "audio/x-pn-wav"):
+        raise HTTPException(400, "Требуется WAV (Content-Type audio/wav)")
 
-    body = await file.read()
+    wav_bytes = await file.read()
 
-    # Build system prompt depending on scenario
-    base_system_prompt = ""
     if scenario == "dialog":
-        base_system_prompt = """
-Ты - помощник, свободно владеющий татарским языком. 
-Твоя задача - вести диалог на татарском языке, отвечая на вопросы пользователя.
-Отвечай ТОЛЬКО на татарском языке, используя современную орфографию.
-Будь дружелюбным и полезным собеседником.
-Продолжай диалог и не присылай спецсимволы в ответ, так как потом он будет озвучиваться.
-        """
+        base_system_prompt = (
+            "Ты - помощник, свободно владеющий татарским языком. "
+            "Отвечай ТОЛЬКО на татарском, современная орфография. "
+            "Не используй спецсимволы."
+        )
     else:
-        base_system_prompt = """
-Ты - преподаватель татарского языка.
-Твоя задача - помогать в изучении татарского языка.
-Когда пользователь пишет на татарском:
-1. Дай перевод на русский
-2. Объясни грамматические конструкции
-3. Укажи на ошибки, если они есть
-4. Предложи, как можно улучшить фразу
-Отвечай на русском языке.
-Не используй спецсимволы в ответе, так как потом он будет озвучиваться.
-        """
-
-    system_prompt = base_system_prompt
-    if system_prompt_ru:
-        system_prompt = f"{base_system_prompt}\n\nДополнительные инструкции:\n{system_prompt_ru}"
-
-    # Send audio directly to GigaChat audio endpoint (or audio proxy)
-    recognized, assistant_from_audio = await gigachat_audio_complete(body, system_prompt)
-
-    # If assistant reply came back in the audio endpoint response, use it.
-    if assistant_from_audio:
-        model_response = assistant_from_audio
-        # If recognized text present, save as user message; otherwise nobody
-        if recognized:
-            chat_history.add_message("user", recognized)
-        chat_history.add_message("assistant", model_response)
-    else:
-        # No assistant reply from audio endpoint: use recognized text to call gigachat as before
-        if not recognized:
-            raise HTTPException(502, "Audio endpoint did not return assistant text or recognized text")
-        chat_history.add_message("user", recognized)
-        model_response = await gigachat_complete(recognized, system_prompt)
-        chat_history.add_message("assistant", model_response)
-
-    # Get TTS audio for model response
-    tts_url = "https://tat-tts.api.translate.tatar/listening/"
-    params = {"speaker": "alsu", "text": model_response}
-    async with httpx.AsyncClient(verify=False) as client:
-        audio_response = await client.get(tts_url, params=params)
-        if audio_response.status_code != 200:
-            raise HTTPException(502, f"TTS API error: {audio_response.text}")
-        audio_base64 = audio_response.text
-
-    return ChatOut(
-        input_tat=recognized,
-        translated_to_ru="Прямое общение с моделью",
-        model_answer_ru=model_response,
-        audio_base64=audio_base64,
-        recognized_tat=recognized
+        base_system_prompt = (
+            "Ты - преподаватель татарского языка. "
+            "1) Переведи на русский. 2) Объясни грамматику. 3) Исправь ошибки. "
+            "4) Предложи улучшение. Отвечай на русском. Без спецсимволов."
+        )
+    system_prompt = (
+        base_system_prompt if not system_prompt_ru
+        else base_system_prompt + "\n\nДополнительные инструкции:\n" + system_prompt_ru
     )
 
+    _, assistant = await gigachat_audio_complete(wav_bytes, system_prompt)
+    chat_history.add_message("user", "[voice]")
+    chat_history.add_message("assistant", assistant)
 
+    # TTS
+    tts_url = "https://tat-tts.api.translate.tatar/listening/"
+    params = {"speaker": "alsu", "text": assistant}
+    async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS, verify=False) as client:
+        audio_response = await client.get(tts_url, params=params)
+    if audio_response.status_code != 200:
+        raise HTTPException(502, f"TTS API error: {audio_response.text}")
+    audio_base64 = audio_response.text
+
+    return ChatOut(
+        input_tat=None,
+        translated_to_ru="Прямое общение с моделью",
+        model_answer_ru=assistant,
+        audio_base64=audio_base64,
+        recognized_tat=None,
+    )
 
 @app.get("/health")
 async def health():
@@ -275,11 +367,5 @@ async def health():
 
 @app.post("/clear-history")
 async def clear_chat_history():
-    """Очистить историю диалога"""
     chat_history.clear()
     return {"status": "ok"}
-
-# Корректно закрываем клиент при остановке
-@app.on_event("shutdown")
-async def _shutdown():
-    await client.aclose()
