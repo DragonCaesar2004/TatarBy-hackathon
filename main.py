@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     TATSOFT_BASE_URL: str = "https://v2.api.translate.tatar"
     GIGACHAT_BASE_URL: str = "https://gigachat.devices.sberbank.ru/api/v1"
     GIGACHAT_MODEL: str = "GigaChat"
-    STT_URL: Optional[str] = None
+    GIGACHAT_AUDIO_URL: Optional[str] = "https://gigachat.devices.sberbank.ru/api/v1/files"
     REQUEST_TIMEOUT_SECONDS: int = 15
 
     class Config:
@@ -35,10 +35,11 @@ class ChatIn(BaseModel):
     system_prompt_ru: Optional[str] = None
 
 class ChatOut(BaseModel):
-    input_tat: str
+    input_tat: Optional[str] = None
     translated_to_ru: str
     model_answer_ru: str
     audio_base64: str  # аудио в формате base64
+    recognized_tat: Optional[str] = None
 
 # ------------ Helpers ------------
 async def gigachat_complete(prompt_ru: str, system_ru: Optional[str]) -> str:
@@ -88,39 +89,44 @@ async def gigachat_complete(prompt_ru: str, system_ru: Optional[str]) -> str:
         raise HTTPException(502, f"GigaChat: неожиданный ответ {data}")
 
 
-async def stt_recognize_wav(wav_bytes: bytes) -> str:
-    """Send raw WAV bytes to STT model endpoint and return recognized Tatar text.
+async def gigachat_audio_complete(wav_bytes: bytes, system_ru: Optional[str] = None) -> tuple:
+    """Send WAV bytes to GigaChat audio endpoint and return (json_dict_or_None, assistant_or_None).
 
-    The STT endpoint URL is read from settings.STT_URL and should accept raw audio
-    in the request body and return plain text or JSON containing the recognized text.
+    Returns:
+      (parsed_json, assistant_text) if Content-Type is JSON (parsed_json may be any JSON),
+      (None, assistant_text) if response is plain text.
     """
-    if not settings.STT_URL:
-        raise HTTPException(500, "STT service URL is not configured (STT_URL)")
+    if not settings.GIGACHAT_AUDIO_URL:
+        raise HTTPException(500, "GigaChat audio URL is not configured (GIGACHAT_AUDIO_URL)")
 
-    headers = {"Content-Type": "audio/wav"}
+    bearer = get_token()
+    headers = {"Authorization": bearer} if bearer else {}
+
+    files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
+    data = {}
+    if system_ru:
+        data["system_prompt"] = system_ru
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(settings.REQUEST_TIMEOUT_SECONDS), verify=False) as client:
-        r = await client.post(settings.STT_URL, content=wav_bytes, headers=headers)
+        r = await client.post(settings.GIGACHAT_AUDIO_URL, headers=headers, data=data, files=files)
 
     if r.status_code != 200:
-        raise HTTPException(502, f"STT error: {r.status_code} {r.text}")
+        raise HTTPException(502, f"GigaChat audio error: {r.status_code} {r.text}")
 
     ctype = r.headers.get("Content-Type", "")
     if "json" in ctype:
         try:
             j = r.json()
         except Exception:
-            raise HTTPException(502, f"STT returned invalid JSON: {r.text}")
+            raise HTTPException(502, f"GigaChat audio returned invalid JSON: {r.text}")
 
-        for k in ("text", "result", "transcript", "recognized_text"):
-            if k in j:
-                return j[k]
-        for v in j.values():
-            if isinstance(v, str):
-                return v
-        raise HTTPException(502, f"STT JSON did not contain recognized text: {j}")
+        assistant = None
+        if isinstance(j, dict) and isinstance(j.get("assistant"), str):
+            assistant = j.get("assistant")
+        return j, assistant
 
-    return r.text.strip()
+    assistant = r.text.strip()
+    return None, assistant
 
 # ------------ FastAPI ------------
 app = FastAPI(title="Tat↔Ru dialog proxy", version="1.0.0")
@@ -199,9 +205,6 @@ async def chat_audio(file: UploadFile = File(...), scenario: Optional[Literal["s
 
     body = await file.read()
 
-    # Recognize via STT
-    recognized = await stt_recognize_wav(body)
-
     # Build system prompt depending on scenario
     base_system_prompt = ""
     if scenario == "dialog":
@@ -229,12 +232,23 @@ async def chat_audio(file: UploadFile = File(...), scenario: Optional[Literal["s
     if system_prompt_ru:
         system_prompt = f"{base_system_prompt}\n\nДополнительные инструкции:\n{system_prompt_ru}"
 
-    # Save recognized text to history
-    chat_history.add_message("user", recognized)
+    # Send audio directly to GigaChat audio endpoint (or audio proxy)
+    recognized, assistant_from_audio = await gigachat_audio_complete(body, system_prompt)
 
-    # Forward to gigachat
-    model_response = await gigachat_complete(recognized, system_prompt)
-    chat_history.add_message("assistant", model_response)
+    # If assistant reply came back in the audio endpoint response, use it.
+    if assistant_from_audio:
+        model_response = assistant_from_audio
+        # If recognized text present, save as user message; otherwise nobody
+        if recognized:
+            chat_history.add_message("user", recognized)
+        chat_history.add_message("assistant", model_response)
+    else:
+        # No assistant reply from audio endpoint: use recognized text to call gigachat as before
+        if not recognized:
+            raise HTTPException(502, "Audio endpoint did not return assistant text or recognized text")
+        chat_history.add_message("user", recognized)
+        model_response = await gigachat_complete(recognized, system_prompt)
+        chat_history.add_message("assistant", model_response)
 
     # Get TTS audio for model response
     tts_url = "https://tat-tts.api.translate.tatar/listening/"
