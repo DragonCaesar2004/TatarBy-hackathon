@@ -60,6 +60,20 @@ python -m uvicorn main:app --reload
 ### POST /clear-history
 Очистить историю диалога.
 
+## Running with Docker
+
+Build and run the application with Docker:
+
+1. Build the image:
+
+  docker build -t tatby:latest .
+
+2. Run with docker-compose (recommended for development):
+
+  docker compose up --build
+
+The app will be available at http://localhost:8000
+
 ### GET /health
 Проверка работоспособности сервиса.
 
