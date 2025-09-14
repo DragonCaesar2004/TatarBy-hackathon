@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     TATSOFT_BASE_URL: str = "https://v2.api.translate.tatar"
     GIGACHAT_BASE_URL: str = "https://gigachat.devices.sberbank.ru/api/v1"
     # Твоя желаемая модель (может не уметь аудио) — авто-фолбэк выбирает подходящую
-    GIGACHAT_MODEL: str = "GigaChat-2-Max"
+    GIGACHAT_MODEL: str = "GigaChat-Pro"
     REQUEST_TIMEOUT_SECONDS: int = 20
 
     class Config:
@@ -126,6 +126,7 @@ def _rank_audio_candidates(all_models: List[str]) -> List[str]:
         for mid in all_models:
             if mid not in ranked:
                 ranked.append(mid)
+        print('moooooooodel:   ', ranked)
         return ranked
 
     # 2) если /models недоступен — просто возвращаем known + preferred в конце
@@ -210,8 +211,13 @@ async def _gc_chat_auto(messages: List[Dict[str, Any]]) -> str:
 
     # Составим список кандидатов: из /models (если доступен) + эвристики
     all_models = await _gc_list_models()
+
+
+    
     print(f"[DEBUG] Кандидаты моделей: {all_models}")
-    candidates = _rank_audio_candidates(all_models)
+    candidates = [settings.GIGACHAT_MODEL] 
+
+
     print(f"[DEBUG] Отранжированные кандидаты: {candidates}")
 
     # Пробуем по порядку, пока не найдём модель, которая принимает аудио
@@ -232,8 +238,7 @@ async def _gc_chat_auto(messages: List[Dict[str, Any]]) -> str:
 
     # Если сюда дошли — ни одна из моделей не приняла аудио
     print(f"[ERROR] Ни одна из моделей не приняла аудио. last_err={last_err}")
-    if last_err == "NO_AUDIO":
-        raise HTTPException(422, "Ни одна из доступных моделей не поддерживает аудио-вложения для вашего токена.")
+
     raise HTTPException(502, f"Не удалось получить ответ от моделей: {last_err or 'unknown error'}")
 
 # =========================
