@@ -171,8 +171,45 @@ async def _gc_chat_with_model(messages: List[Dict[str, Any]], model: str) -> Tup
     """
     base = settings.GIGACHAT_BASE_URL.rstrip("/")
     headers = await _client_json_headers()
-    payload = {"model": model, "messages": messages, "temperature": 0.2}
+    
+    # Separate attachments from messages if present
+    attachments = []
+    processed_messages = []
+    
+    for message in messages:
+        # Check if this is a user message with attachments
+        if message.get("role") == "user" and "attachments" in message:
+            # Extract attachments
+            msg_attachments = message.get("attachments", [])
+            if msg_attachments:
+                # Convert file IDs to the proper attachment format
+                for attachment_id in msg_attachments:
+                    attachments.append({
+                        "type": "input_audio",
+                        "data": attachment_id  # This should be the file ID returned by /files endpoint
+                    })
+                # Remove attachments from the message
+                message_copy = message.copy()
+                message_copy.pop("attachments", None)
+                processed_messages.append(message_copy)
+            else:
+                processed_messages.append(message)
+        else:
+            processed_messages.append(message)
+    
+    # Build payload with attachments at top level if present
+    payload = {
+        "model": model,
+        "messages": processed_messages,
+        "temperature": 0.2
+    }
+    
+    # Add attachments to payload if present
+    if attachments:
+        payload["attachments"] = attachments
+    
     print(f"[DEBUG] Пробуем модель: {model}")
+    print(f"[DEBUG] Payload: {payload}")
     async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS, verify=False) as client:
         r = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
     print(f"[DEBUG] Ответ от /chat/completions для модели {model}: {r.status_code}, {r.text}")
