@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     TATSOFT_BASE_URL: str = "https://v2.api.translate.tatar"
     GIGACHAT_BASE_URL: str = "https://gigachat.devices.sberbank.ru/api/v1"
     # Твоя желаемая модель (может не уметь аудио) — авто-фолбэк выбирает подходящую
-    GIGACHAT_MODEL: str = "GigaChat"
+    GIGACHAT_MODEL: str = "GigaChat-2-Max"
     REQUEST_TIMEOUT_SECONDS: int = 20
 
     class Config:
