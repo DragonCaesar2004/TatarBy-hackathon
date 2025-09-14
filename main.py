@@ -365,6 +365,50 @@ async def chat_audio(
 async def health():
     return {"status": "ok"}
 
+@app.get("/greet")
+async def get_greeting() -> ChatOut:
+    greetings = [
+        "Сәлам! Синең хәлләр ничек?",
+        "Сәлам! Син хәзер нәрсә эшлисең?",
+        "Сәлам! Синең кәеф ничек?",
+        "Сәлам! Минем исемем Алия, ә синең исемең ничек?",
+        "ә синең исемең ничек?"
+    ]
+    import random
+    greeting = random.choice(greetings)
+    
+    # Очищаем историю перед началом нового диалога
+    chat_history.clear()
+    
+    system_prompt = (
+        "Ты - помощник, свободно владеющий татарским языком. "
+        "Веди диалог ТОЛЬКО на татарском, современная орфография. "
+        "Не используй спецсимволы в ответе. "
+        f"Ты начала диалог с фразы: {greeting} - продолжай диалог в этом контексте."
+    )
+    
+    # Добавляем системный промпт в начало истории
+    chat_history.add_message("system", system_prompt)
+    # Добавляем приветствие в историю
+    chat_history.add_message("assistant", greeting)
+    
+    # TTS для приветствия
+    tts_url = "https://tat-tts.api.translate.tatar/listening/"
+    params = {"speaker": "alsu", "text": greeting}
+    async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS, verify=False) as client:
+        audio_response = await client.get(tts_url, params=params)
+    if audio_response.status_code != 200:
+        raise HTTPException(502, f"TTS API error: {audio_response.text}")
+    audio_base64 = audio_response.text
+    
+    return ChatOut(
+        input_tat=None,
+        translated_to_ru="Приветствие от ассистента",
+        model_answer_ru=greeting,
+        audio_base64=audio_base64,
+        recognized_tat=None
+    )
+
 @app.post("/clear-history")
 async def clear_chat_history():
     chat_history.clear()
