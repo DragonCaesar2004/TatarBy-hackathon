@@ -212,9 +212,12 @@ async def _gc_chat_auto(messages: List[Dict[str, Any]]) -> str:
     # Составим список кандидатов: из /models (если доступен) + эвристики
     all_models = await _gc_list_models()
 
+
     
     print(f"[DEBUG] Кандидаты моделей: {all_models}")
     candidates = [settings.GIGACHAT_MODEL] 
+
+
     print(f"[DEBUG] Отранжированные кандидаты: {candidates}")
 
     # Пробуем по порядку, пока не найдём модель, которая принимает аудио
