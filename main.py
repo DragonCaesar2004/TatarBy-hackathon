@@ -241,9 +241,18 @@ async def _gc_chat_auto(messages: List[Dict[str, Any]]) -> str:
 # =========================
 async def gigachat_complete(prompt_ru: str, system_ru: Optional[str]) -> str:
     msgs: List[Dict[str, Any]] = []
+    
+    # Системное сообщение должно быть ПЕРВЫМ
     if system_ru:
         msgs.append({"role": "system", "content": system_ru})
-    msgs.extend(chat_history.get_messages())
+    
+    # Добавляем историю чата (исключая системные сообщения, если они есть)
+    history_messages = chat_history.get_messages()
+    for msg in history_messages:
+        # Пропускаем системные сообщения из истории, так как у нас уже есть свое
+        if msg.get("role") != "system":
+            msgs.append(msg)
+    
     msgs.append({"role": "user", "content": prompt_ru})
 
     # Для чисто текстового режима используем твою базовую модель напрямую
@@ -277,9 +286,19 @@ async def gigachat_audio_complete(wav_bytes: bytes, system_ru: Optional[str]) ->
     print(f"[DEBUG] File uploaded with ID: {file_id}")
 
     msgs: List[Dict[str, Any]] = []
+    
+    # Системное сообщение должно быть ПЕРВЫМ
     if system_ru:
         msgs.append({"role": "system", "content": system_ru})
-    msgs.extend(chat_history.get_messages())
+    
+    # Добавляем историю чата (исключая системные сообщения, если они есть)
+    history_messages = chat_history.get_messages()
+    for msg in history_messages:
+        # Пропускаем системные сообщения из истории, так как у нас уже есть свое
+        if msg.get("role") != "system":
+            msgs.append(msg)
+    
+    # Добавляем пользовательское сообщение с аудио
     msgs.append({
         "role": "user",
         "content": "Транскрибируй это аудио и ответь по инструкции.",
