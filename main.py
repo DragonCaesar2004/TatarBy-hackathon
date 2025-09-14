@@ -70,8 +70,10 @@ async def _gc_list_models() -> List[str]:
     base = settings.GIGACHAT_BASE_URL.rstrip("/")
     headers = await _client_json_headers()
     try:
+        print("[DEBUG] Запрашиваем список моделей у GigaChat...")
         async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS, verify=False) as client:
             r = await client.get(f"{base}/models", headers=headers)
+        print(f"[DEBUG] /models status: {r.status_code}, response: {r.text}")
         if r.status_code != 200:
             return []
         j = r.json()
@@ -81,8 +83,10 @@ async def _gc_list_models() -> List[str]:
             mid = m.get("id")
             if isinstance(mid, str):
                 ids.append(mid)
+        print(f"[DEBUG] Найдено моделей: {ids}")
         return ids
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] Ошибка при получении списка моделей: {e}")
         return []
 
 def _rank_audio_candidates(all_models: List[str]) -> List[str]:
@@ -167,19 +171,21 @@ async def _gc_chat_with_model(messages: List[Dict[str, Any]], model: str) -> Tup
     base = settings.GIGACHAT_BASE_URL.rstrip("/")
     headers = await _client_json_headers()
     payload = {"model": model, "messages": messages, "temperature": 0.2}
-
+    print(f"[DEBUG] Пробуем модель: {model}")
     async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS, verify=False) as client:
         r = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
-
+    print(f"[DEBUG] Ответ от /chat/completions для модели {model}: {r.status_code}, {r.text}")
     if r.status_code == 200:
         j = r.json()
         try:
             return True, j["choices"][0]["message"]["content"], None
         except Exception:
+            print(f"[ERROR] Неожиданный JSON: {r.text}")
             return False, None, f"Unexpected JSON: {r.text}"
 
     # 422 из-за аудио — ключевой кейс
     if r.status_code == 422 and "Model does not support audio" in r.text:
+        print(f"[DEBUG] Модель {model} не поддерживает аудио")
         return False, None, "NO_AUDIO"
 
     return False, None, r.text
@@ -189,26 +195,35 @@ async def _gc_chat_auto(messages: List[Dict[str, Any]]) -> str:
     Вызывает чат: если текущая модель не умеет аудио — автопоиск и кэширование подходящей.
     """
     global _AUDIO_MODEL_ID
+    print(f"[DEBUG] === _gc_chat_auto: AUDIO_MODEL_ID={_AUDIO_MODEL_ID}")
+    print(f"[DEBUG] Сообщения для отправки: {messages}")
 
     # Если уже нашли и закэшировали — пробуем сначала её
     if _AUDIO_MODEL_ID:
+        print(f"[DEBUG] Пробуем закэшированную модель: {_AUDIO_MODEL_ID}")
         ok, text, err = await _gc_chat_with_model(messages, _AUDIO_MODEL_ID)
         if ok:
+            print(f"[DEBUG] Успех с кэшированной моделью: {_AUDIO_MODEL_ID}")
             return text
-        # если вдруг перестала работать — сбросим кэш и продолжим автопоиск
+        print(f"[DEBUG] Кэшированная модель не сработала: {err}")
         _AUDIO_MODEL_ID = None
 
     # Составим список кандидатов: из /models (если доступен) + эвристики
     all_models = await _gc_list_models()
+    print(f"[DEBUG] Кандидаты моделей: {all_models}")
     candidates = _rank_audio_candidates(all_models)
+    print(f"[DEBUG] Отранжированные кандидаты: {candidates}")
 
     # Пробуем по порядку, пока не найдём модель, которая принимает аудио
     last_err = None
     for mid in candidates:
+        print(f"[DEBUG] Пробуем модель-кандидат: {mid}")
         ok, text, err = await _gc_chat_with_model(messages, mid)
         if ok:
+            print(f"[DEBUG] Успех с моделью: {mid}")
             _AUDIO_MODEL_ID = mid  # кэшируем успешную
             return text
+        print(f"[DEBUG] Ошибка для {mid}: {err}")
         last_err = err
         # Если модель явно не поддерживает аудио — просто идём дальше
         if err == "NO_AUDIO":
@@ -216,6 +231,7 @@ async def _gc_chat_auto(messages: List[Dict[str, Any]]) -> str:
         # Иначе это другое отклонение (401/404/429/500) — тоже попробуем следующий mid
 
     # Если сюда дошли — ни одна из моделей не приняла аудио
+    print(f"[ERROR] Ни одна из моделей не приняла аудио. last_err={last_err}")
     if last_err == "NO_AUDIO":
         raise HTTPException(422, "Ни одна из доступных моделей не поддерживает аудио-вложения для вашего токена.")
     raise HTTPException(502, f"Не удалось получить ответ от моделей: {last_err or 'unknown error'}")
@@ -253,7 +269,12 @@ async def gigachat_audio_complete(wav_bytes: bytes, system_ru: Optional[str]) ->
     Аудио → ответ: /files -> /chat/completions + attachments.
     Если модель не поддерживает аудио — авто-подбор подходящей и кэширование.
     """
+    print(f"[DEBUG] === gigachat_audio_complete: Starting audio processing")
+    print(f"[DEBUG] Audio bytes length: {len(wav_bytes)}")
+    print(f"[DEBUG] System prompt: {system_ru}")
+    
     file_id = await _gc_upload_file("audio.wav", wav_bytes, "audio/wav")
+    print(f"[DEBUG] File uploaded with ID: {file_id}")
 
     msgs: List[Dict[str, Any]] = []
     if system_ru:
@@ -264,8 +285,11 @@ async def gigachat_audio_complete(wav_bytes: bytes, system_ru: Optional[str]) ->
         "content": "Транскрибируй это аудио и ответь по инструкции.",
         "attachments": [file_id],
     })
+    
+    print(f"[DEBUG] Messages to send: {msgs}")
 
     assistant_text = await _gc_chat_auto(msgs)
+    print(f"[DEBUG] Received response from _gc_chat_auto: {assistant_text}")
     return None, assistant_text
 
 # =========================
@@ -318,10 +342,16 @@ async def chat_audio(
     scenario: Optional[Literal["studying", "dialog"]] = "dialog",
     system_prompt_ru: Optional[str] = None,
 ):
+    print(f"[DEBUG] === /chat-audio endpoint called")
+    print(f"[DEBUG] File content type: {file.content_type}")
+    print(f"[DEBUG] Scenario: {scenario}")
+    print(f"[DEBUG] System prompt: {system_prompt_ru}")
+    
     if file.content_type not in ("audio/wav", "audio/x-wav", "audio/wave", "audio/x-pn-wav"):
         raise HTTPException(400, "Требуется WAV (Content-Type audio/wav)")
 
     wav_bytes = await file.read()
+    print(f"[DEBUG] Read {len(wav_bytes)} bytes from uploaded file")
 
     if scenario == "dialog":
         base_system_prompt = (
@@ -340,7 +370,10 @@ async def chat_audio(
         else base_system_prompt + "\n\nДополнительные инструкции:\n" + system_prompt_ru
     )
 
+    print(f"[DEBUG] Calling gigachat_audio_complete")
     _, assistant = await gigachat_audio_complete(wav_bytes, system_prompt)
+    print(f"[DEBUG] Received response from gigachat_audio_complete: {assistant}")
+    
     chat_history.add_message("user", "[voice]")
     chat_history.add_message("assistant", assistant)
 
