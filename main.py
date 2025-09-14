@@ -171,6 +171,7 @@ async def _gc_chat_with_model(messages: List[Dict[str, Any]], model: str) -> Tup
     """
     base = settings.GIGACHAT_BASE_URL.rstrip("/")
     headers = await _client_json_headers()
+
     
     # Separate attachments from messages if present
     attachments = []
@@ -210,6 +211,7 @@ async def _gc_chat_with_model(messages: List[Dict[str, Any]], model: str) -> Tup
     
     print(f"[DEBUG] Пробуем модель: {model}")
     print(f"[DEBUG] Payload: {payload}")
+
     async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS, verify=False) as client:
         r = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
     print(f"[DEBUG] Ответ от /chat/completions для модели {model}: {r.status_code}, {r.text}")
@@ -249,9 +251,11 @@ async def _gc_chat_auto(messages: List[Dict[str, Any]]) -> str:
     # Составим список кандидатов: из /models (если доступен) + эвристики
     all_models = await _gc_list_models()
 
+
     
     print(f"[DEBUG] Кандидаты моделей: {all_models}")
     candidates = [settings.GIGACHAT_MODEL] 
+
     print(f"[DEBUG] Отранжированные кандидаты: {candidates}")
 
     # Пробуем по порядку, пока не найдём модель, которая принимает аудио
